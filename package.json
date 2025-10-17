@@ -203,7 +203,7 @@
     "name": "播放限速",
     "description": "外网播放媒体库视频时，自动对下载器进行限速。",
     "labels": "网络",
-    "version": "1.3",
+    "version": "3.3",
     "icon": "Librespeed_A.png",
     "author": "Shurelol",
     "level": 1,
