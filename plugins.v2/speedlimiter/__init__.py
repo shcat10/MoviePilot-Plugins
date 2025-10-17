@@ -15,9 +15,9 @@ from app.schemas.types import EventType
 from app.utils.ip import IpUtils
 
 
-class SpeedLimiter(_PluginBase):
+class SpeedLimiter1(_PluginBase):
     # 插件名称
-    plugin_name = "播放限速"
+    plugin_name = "播放限速1"
     # 插件描述
     plugin_desc = "外网播放媒体库视频时，自动对下载器进行限速。"
     # 插件图标
@@ -29,7 +29,7 @@ class SpeedLimiter(_PluginBase):
     # 作者主页
     author_url = "https://github.com/shcat10"
     # 插件配置项ID前缀
-    plugin_config_prefix = "speedlimit_"
+    plugin_config_prefix = "speedlimit1_"
     # 加载顺序
     plugin_order = 1
     # 可使用的用户级别
