@@ -1,12 +1,16 @@
 import ipaddress
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Tuple, Dict, Any
 
+from app.core.config import settings
 from app.core.event import eventmanager, Event
-from app.helper.downloader import DownloaderHelper
-from app.helper.mediaserver import MediaServerHelper
 from app.log import logger
+from app.modules.emby import Emby
+from app.modules.jellyfin import Jellyfin
+from app.modules.plex import Plex
+from app.modules.qbittorrent import Qbittorrent
+from app.modules.transmission import Transmission
 from app.plugins import _PluginBase
-from app.schemas import NotificationType, WebhookEventInfo, ServiceInfo
+from app.schemas import NotificationType, WebhookEventInfo
 from app.schemas.types import EventType
 from app.utils.ip import IpUtils
 
@@ -19,20 +23,22 @@ class SpeedLimiter(_PluginBase):
     # 插件图标
     plugin_icon = "Librespeed_A.png"
     # 插件版本
-    plugin_version = "2.1"
+    plugin_version = "3.3"
     # 插件作者
-    plugin_author = "Shurelol"
+    plugin_author = "shcat10"
     # 作者主页
-    author_url = "https://github.com/Shurelol"
+    author_url = "https://github.com/shcat10"
     # 插件配置项ID前缀
     plugin_config_prefix = "speedlimit_"
     # 加载顺序
-    plugin_order = 11
+    plugin_order = 1
     # 可使用的用户级别
     auth_level = 1
 
     # 私有属性
     _scheduler = None
+    _qb = None
+    _tr = None
     _enabled: bool = False
     _notify: bool = False
     _interval: int = 60
@@ -42,6 +48,7 @@ class SpeedLimiter(_PluginBase):
     _noplay_up_speed: float = 0
     _noplay_down_speed: float = 0
     _bandwidth: float = 0
+    _reserved_bandwidth: float = 0
     _allocation_ratio: str = ""
     _auto_limit: bool = False
     _limit_enabled: bool = False
@@ -52,7 +59,6 @@ class SpeedLimiter(_PluginBase):
     _exclude_path = ""
 
     def init_plugin(self, config: dict = None):
-
         # 读取配置
         if config:
             self._enabled = config.get("enabled")
@@ -67,6 +73,10 @@ class SpeedLimiter(_PluginBase):
             try:
                 # 总带宽
                 self._bandwidth = int(float(config.get("bandwidth") or 0)) * 1000000
+                self._reserved_bandwidth = int(float(config.get("reserved_bandwidth") or 0)) * 1000000
+                # 减去预留带宽
+                if self._reserved_bandwidth:
+                    self._bandwidth -= self._reserved_bandwidth
                 # 自动限速开关
                 if self._bandwidth > 0:
                     self._auto_limit = True
@@ -86,6 +96,11 @@ class SpeedLimiter(_PluginBase):
             self._unlimited_ips["ipv6"] = config.get("ipv6") or ""
 
             self._downloader = config.get("downloader") or []
+            if self._downloader:
+                if 'qbittorrent' in self._downloader:
+                    self._qb = Qbittorrent()
+                if 'transmission' in self._downloader:
+                    self._tr = Transmission()
 
     def get_state(self) -> bool:
         return self._enabled
@@ -167,20 +182,18 @@ class SpeedLimiter(_PluginBase):
                         'content': [
                             {
                                 'component': 'VCol',
-                                'props': {
-                                    'cols': 12
-                                },
                                 'content': [
                                     {
                                         'component': 'VSelect',
                                         'props': {
-                                            'multiple': True,
                                             'chips': True,
-                                            'clearable': True,
+                                            'multiple': True,
                                             'model': 'downloader',
                                             'label': '下载器',
-                                            'items': [{"title": config.name, "value": config.name}
-                                                      for config in DownloaderHelper().get_configs().values()]
+                                            'items': [
+                                                {'title': 'Qbittorrent', 'value': 'qbittorrent'},
+                                                {'title': 'Transmission', 'value': 'transmission'},
+                                            ]
                                         }
                                     }
                                 ]
@@ -311,6 +324,23 @@ class SpeedLimiter(_PluginBase):
                                         }
                                     }
                                 ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 6
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'reserved_bandwidth',
+                                            'label': '预留带宽（应对突发流量和额外开销）',
+                                            'placeholder': 'Mbps'
+                                        }
+                                    }
+                                ]
                             }
                         ]
                     },
@@ -390,39 +420,12 @@ class SpeedLimiter(_PluginBase):
     def get_page(self) -> List[dict]:
         pass
 
-    @property
-    def service_infos(self) -> Optional[Dict[str, ServiceInfo]]:
-        """
-        服务信息
-        """
-        if not self._downloader:
-            logger.warning("尚未配置下载器，请检查配置")
-            return None
-
-        services = DownloaderHelper().get_services(name_filters=self._downloader)
-        if not services:
-            logger.warning("获取下载器实例失败，请检查配置")
-            return None
-
-        active_services = {}
-        for service_name, service_info in services.items():
-            if service_info.instance.is_inactive():
-                logger.warning(f"下载器 {service_name} 未连接，请检查配置")
-            else:
-                active_services[service_name] = service_info
-
-        if not active_services:
-            logger.warning("没有已连接的下载器，请检查配置")
-            return None
-
-        return active_services
-
     @eventmanager.register(EventType.WebhookMessage)
     def check_playing_sessions(self, event: Event = None):
         """
         检查播放会话
         """
-        if not self.service_infos:
+        if not self._qb and not self._tr:
             return
         if not self._enabled:
             return
@@ -439,17 +442,18 @@ class SpeedLimiter(_PluginBase):
                 return
         # 当前播放的总比特率
         total_bit_rate = 0
-        media_servers = MediaServerHelper().get_services()
-        if not media_servers:
+        # 媒体服务器类型，多个以,分隔
+        if not settings.MEDIASERVER:
             return
+        media_servers = settings.MEDIASERVER.split(',')
         # 查询所有媒体服务器状态
-        for server, service in media_servers.items():
+        for media_server in media_servers:
             # 查询播放中会话
             playing_sessions = []
-            if service.type == "emby":
+            if media_server == "emby":
                 req_url = "[HOST]emby/Sessions?api_key=[APIKEY]"
                 try:
-                    res = service.instance.get_data(req_url)
+                    res = Emby().get_data(req_url)
                     if res and res.status_code == 200:
                         sessions = res.json()
                         for session in sessions:
@@ -470,11 +474,13 @@ class SpeedLimiter(_PluginBase):
                     # 未设置不限速范围，则默认不限速内网ip
                     elif not IpUtils.is_private_ip(session.get("RemoteEndPoint")) \
                             and session.get("NowPlayingItem", {}).get("MediaType") == "Video":
+                        logger.debug(f"当前播放内容：{session.get('NowPlayingItem').get('FileName')}，"
+                                     f"比特率：{int(session.get('NowPlayingItem', {}).get('Bitrate') or 0)}")
                         total_bit_rate += int(session.get("NowPlayingItem", {}).get("Bitrate") or 0)
-            elif service.type == "jellyfin":
+            elif media_server == "jellyfin":
                 req_url = "[HOST]Sessions?api_key=[APIKEY]"
                 try:
-                    res = service.instance.get_data(req_url)
+                    res = Jellyfin().get_data(req_url)
                     if res and res.status_code == 200:
                         sessions = res.json()
                         for session in sessions:
@@ -499,8 +505,8 @@ class SpeedLimiter(_PluginBase):
                         media_streams = session.get("NowPlayingItem", {}).get("MediaStreams") or []
                         for media_stream in media_streams:
                             total_bit_rate += int(media_stream.get("BitRate") or 0)
-            elif service.type == "plex":
-                _plex = service.instance.get_plex()
+            elif media_server == "plex":
+                _plex = Plex().get_plex()
                 if _plex:
                     sessions = _plex.sessions()
                     for session in sessions:
@@ -523,6 +529,7 @@ class SpeedLimiter(_PluginBase):
                             total_bit_rate += int(session.get("bitrate") or 0)
 
         if total_bit_rate:
+            logger.debug(f"比特率总计：{total_bit_rate}")
             # 开启智能限速计算上传限速
             if self._auto_limit:
                 play_up_speed = self.__calc_limit(total_bit_rate)
@@ -530,6 +537,7 @@ class SpeedLimiter(_PluginBase):
                 play_up_speed = self._play_up_speed
 
             # 当前正在播放，开始限速
+            logger.debug(f"上传限速：{play_up_speed} KB/s")
             self.__set_limiter(limit_type="播放", upload_limit=play_up_speed,
                                download_limit=self._play_down_speed)
         else:
@@ -553,7 +561,8 @@ class SpeedLimiter(_PluginBase):
         """
         计算智能上传限速
         """
-        if not self._bandwidth:
+        # 当前总比特率大于总带宽，则设置为最低限速
+        if not self._bandwidth or total_bit_rate > self._bandwidth:
             return 10
         return round((self._bandwidth - total_bit_rate) / 8 / 1024, 2)
 
@@ -561,7 +570,7 @@ class SpeedLimiter(_PluginBase):
         """
         设置限速
         """
-        if not self.service_infos:
+        if not self._qb and not self._tr:
             return
         state = f"U:{upload_limit},D:{download_limit}"
         if self._current_state == state:
@@ -572,69 +581,66 @@ class SpeedLimiter(_PluginBase):
             
         try:
             cnt = 0
+            text = ""
             for download in self._downloader:
-                service = self.service_infos.get(download)
+                if cnt != 0:
+                    text = f"{text}\n===================="
+                text = f"{text}\n下载器：{download}"
+                upload_limit_final = upload_limit
                 if self._auto_limit and limit_type == "播放":
                     # 开启了播放智能限速
                     if len(self._downloader) == 1:
                         # 只有一个下载器
-                        upload_limit = int(upload_limit)
+                        upload_limit_final = int(upload_limit)
                     else:
                         # 多个下载器
                         if not self._allocation_ratio:
                             # 平均
-                            upload_limit = int(upload_limit / len(self._downloader))
+                            upload_limit_final = int(upload_limit / len(self._downloader))
                         else:
                             # 按比例
                             allocation_count = sum([int(i) for i in self._allocation_ratio.split(":")])
-                            upload_limit = int(upload_limit * int(self._allocation_ratio.split(":")[cnt]) / allocation_count)
+                            upload_limit_final = int(upload_limit * int(self._allocation_ratio.split(":")[cnt]) / allocation_count)
+                            logger.debug(f"下载器：{download} 分配比例：{self._allocation_ratio.split(':')[cnt]}/{allocation_count} 分配上传限速：{upload_limit_final} KB/s")
                             cnt += 1
-                if upload_limit:
-                    text = f"上传：{upload_limit} KB/s"
+                if upload_limit_final:
+                    text = f"{text}\n上传：{upload_limit_final} KB/s"
                 else:
-                    text = f"上传：未限速"
+                    text = f"{text}\n上传：未限速"
                 if download_limit:
                     text = f"{text}\n下载：{download_limit} KB/s"
                 else:
                     text = f"{text}\n下载：未限速"
-                if service.type == 'qbittorrent':
-                    service.instance.set_speed_limit(download_limit=download_limit, upload_limit=upload_limit)
-                    # 发送通知
-                    if self._notify:
-                        title = "【播放限速】"
-                        if upload_limit or download_limit:
-                            subtitle = f"Qbittorrent 开始{limit_type}限速"
-                            self.post_message(
-                                mtype=NotificationType.MediaServer,
-                                title=title,
-                                text=f"{subtitle}\n{text}"
-                            )
-                        else:
-                            self.post_message(
-                                mtype=NotificationType.MediaServer,
-                                title=title,
-                                text=f"Qbittorrent 已取消限速"
-                            )
+                if str(download) == 'qbittorrent':
+                    if self._qb:
+                        self._qb.set_speed_limit(download_limit=download_limit, upload_limit=upload_limit_final)
                 else:
-                    service.instance.set_speed_limit(download_limit=download_limit, upload_limit=upload_limit)
-                    # 发送通知
-                    if self._notify:
-                        title = "【播放限速】"
-                        if upload_limit or download_limit:
-                            subtitle = f"Transmission 开始{limit_type}限速"
-                            self.post_message(
-                                mtype=NotificationType.MediaServer,
-                                title=title,
-                                text=f"{subtitle}\n{text}"
-                            )
-                        else:
-                            self.post_message(
-                                mtype=NotificationType.MediaServer,
-                                title=title,
-                                text=f"Transmission 已取消限速"
-                            )
+                    if self._tr:
+                        self._tr.set_speed_limit(download_limit=download_limit, upload_limit=upload_limit_final)
+            # 发送通知
+            self._notify_message(text, bool(upload_limit or download_limit), limit_type)
         except Exception as e:
             logger.error(f"设置限速失败：{str(e)}")
+
+    def _notify_message(self, text: str, is_limit: bool, limit_type: str):
+        """
+        发送通知
+        """
+        if self._notify:
+            title = "【播放限速】"
+            if is_limit:
+                subtitle = f"{limit_type}，开始限速"
+                self.post_message(
+                    mtype=NotificationType.MediaServer,
+                    title=title,
+                    text=f"{subtitle}\n{text}"
+                )
+            else:
+                self.post_message(
+                    mtype=NotificationType.MediaServer,
+                    title=title,
+                    text=f"{limit_type}，取消限速"
+                )
 
     @staticmethod
     def __allow_access(allow_ips: dict, ip: str) -> bool:
