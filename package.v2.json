@@ -197,8 +197,8 @@
       "v1.3": "修复v1.8.5版本后刮削报错问题"
     }
   },
-  "SpeedLimiter": {
-    "name": "播放限速",
+  "SpeedLimiter1": {
+    "name": "播放限速1",
     "description": "外网播放媒体库视频时，自动对下载器进行限速。",
     "labels": "网络",
     "version": "3.3",
