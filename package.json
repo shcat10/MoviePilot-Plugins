@@ -205,7 +205,7 @@
     "labels": "网络",
     "version": "3.3",
     "icon": "Librespeed_A.png",
-    "author": "Shurelol",
+    "author": "shcat10",
     "level": 1,
     "history": {
       "v1.3": "修复bug；增加预留带宽设置",
